@@ -2,6 +2,7 @@ package Hessian::Deserializer;
 
 use Moose::Role;
 use version; our $VERSION = qv('0.0.1');
+use YAML;
 
 with qw/
   Hessian::Deserializer::Numeric
@@ -9,7 +10,6 @@ with qw/
   Hessian::Deserializer::Date
   Hessian::Deserializer::Binary
   /;
-
 
 has 'input_handle' => (    #{{{
     is      => 'rw',
@@ -53,7 +53,10 @@ sub deserialize_message {    #{{{
     my ( $self, $args ) = @_;
     my $result;
     eval { $result = $self->read_message_chunk(); };
-    return if Exception::Class->caught('EndOfInput::X');
+    if ( my $e = $@ ) {
+        return if Exception::Class->caught('EndOfInput::X');
+        $e->rethrow() if $e->isa('Hessian::Exception');
+    }
     return $result;
 }    #}}}
 

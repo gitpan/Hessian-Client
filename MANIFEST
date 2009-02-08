@@ -51,6 +51,7 @@ t/lib/Datatype/v1Composite.pm
 t/lib/Datatype/v1Message.pm
 t/lib/Datatype/v2Composite.pm
 t/lib/Datatype/v2Message.pm
+t/lib/SomeType.pm
 t/perlcritic.t
 t/pod-coverage.t
 t/pod.t
