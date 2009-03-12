@@ -45,7 +45,7 @@ sub  t008_initialize_hession_obj : Test(2) { #{{{
 
 sub t010_read_fixed_length_typed : Test(1) {    #{{{
     my $self         = shift;
-    my $hessian_data = "V\x04[int\x92\x90\x91";
+    my $hessian_data = "Vt\x00\x04[int\x6e\x02\x90\x91z";
     my $hessian_obj  = $self->{deserializer};
     $hessian_obj->input_string($hessian_data);
     my $datastructure = $hessian_obj->deserialize_data();
@@ -54,10 +54,11 @@ sub t010_read_fixed_length_typed : Test(1) {    #{{{
 
 sub t011_read_variable_length_typed : Test(1) {    #{{{
     my $self         = shift;
-    my $hessian_data = "\x55\x04[int\x90\x91\xd7\xff\xffZ";
+    my $hessian_data = "Vt\x00\x04[int\x90\x91\xd7\xff\xffz";
     my $datastructure =
       $self->{deserializer}
       ->deserialize_data( { input_string => $hessian_data } );
+      
     cmp_deeply(
         $datastructure,
         [ 0, 1, 262143 ],
@@ -67,35 +68,37 @@ sub t011_read_variable_length_typed : Test(1) {    #{{{
 
 sub t012_read_fixed_length_type : Test(1) {    #{{{
     my $self         = shift;
-    my $hessian_data = "\x73\x04[int\x90\x91\xd7\xff\xff";
+    my $hessian_data = "Vt\x00\x04[int\x90\x91\xd7\xff\xffz";
     my $datastructure =
       $self->{deserializer}
       ->deserialize_data( { input_string => $hessian_data } );
     cmp_deeply(
         $datastructure,
         [ 0, 1, 262143 ],
-        "Received expected datastructure."
+        "Received expected datastructure. ".Dump($datastructure)
     );
 }    #}}}
 
-sub t013_read_fixed_length_untyped : Test(1) {    #{{{
-    my $self         = shift;
-    my $hessian_data = "\x57\x90\x91D\x40\x28\x80\x00\x00\x00\x00\x00\xd7"
-      . "\xff\xff\x52\x00\x07hello, T\x05worldZ";
-    my $datastructure =
-      $self->{deserializer}
-      ->deserialize_data( { input_string => $hessian_data } );
-    cmp_deeply(
-        $datastructure,
-        [ 0, 1, 12.25, 262143, 'hello, ', 1, 'world' ],
-        "Received expected datastructure."
-    );
-}    #}}}
+#sub t013_read_fixed_length_untyped  { #: Test(1) {    #{{{
+#    my $self         = shift;
+#    my $hessian_data = "V\x6e\x07\x90\x91"
+#    ."D\x40\x28\x80\x00\x00\x00\x00\x00\xd7"
+#      . "\xff\xff\x52\x00\x07hello, T\x05worldZ";
+#    my $datastructure =
+#      $self->{deserializer}
+#      ->deserialize_data( { input_string => $hessian_data } );
+#    cmp_deeply(
+#        $datastructure,
+#        [ 0, 1, 12.25, 262143, 'hello, ', 1, 'world' ],
+#        "Received expected datastructure."
+#    );
+#}    #}}}
 
 sub t020_read_typed_map : Test(3) {    #{{{
     my $self         = shift;
-    my $hessian_data = "\x4d\x08SomeType\x05color\x0aaquamarine"
-      . "\x05model\x06Beetle\x07mileageI\x00\x01\x00\x00Z";
+    my $hessian_data = "Mt\x00\x08SomeType"
+    ."\x05color\x0aaquamarine"
+      . "\x05model\x06Beetle\x07mileageI\x00\x01\x00\x00z";
     my $datastructure =
       $self->{deserializer}
       ->deserialize_data( { input_string => $hessian_data } );
@@ -110,7 +113,7 @@ sub t020_read_typed_map : Test(3) {    #{{{
 
 sub t023_read_untyped_map : Test(1) {    #{{{
     my $self         = shift;
-    my $hessian_data = "\x48\x91\x05hello\x04word\x06BeetleZ";
+    my $hessian_data = "M\x91\x05hello\x04word\x06BeetleZ";
 
     my $datastructure =
       $self->{deserializer}
@@ -122,9 +125,9 @@ sub t023_read_untyped_map : Test(1) {    #{{{
     );
 }    #}}}
 
-sub t030_read_class_definition : Test(2) {    #{{{
+sub t030_read_class_definition : Test(1) {    #{{{
     my $self         = shift;
-    my $hessian_data = "C\x0bexample.Car\x92\x05color\x05model";
+    my $hessian_data = "Ot\x00\x0bexample.Car\x92\x05color\x05model";
     my $datastructure =
       $self->{deserializer}
       ->deserialize_data( { input_string => $hessian_data } );
@@ -133,24 +136,23 @@ sub t030_read_class_definition : Test(2) {    #{{{
     # somehow
     push @{ $self->{class_ref} }, $datastructure;
 
-    $hessian_data = "C\x0bexample.Cap\x93\x03row\x04your\x04boat";
+    $hessian_data = "Ot\x00\x0bexample.Cap\x93\x03row\x04your\x04boat";
     $datastructure =
       $self->{deserializer}
       ->deserialize_data( { input_string => $hessian_data } );
     push @{ $self->{class_ref} }, $datastructure;
     pass("Token test that only passes.");
-    pass("Token test that only passes.");
 }    #}}}
 
 sub t031_basic_object : Test(3) {    #{{{
     my $self          = shift;
-    my $hessian_data1 = "\x60\x03RED\x06ferari";
+    my $hessian_data1 = "o\x90\x03RED\x06ferari";
     my $example_car   = $self->class_instance_generator($hessian_data1);
 
     is( $example_car->model(), 'ferari', "Correct car from referenced class." );
     is( $example_car->color(), 'RED',    "Car has the correct color." );
 
-    my $hessian_data2 = "\x61\x05dingy\x06thingy\x05wingy";
+    my $hessian_data2 = "o\x91\x05dingy\x06thingy\x05wingy";
     my $example_cap   = $self->class_instance_generator($hessian_data2);
 
     is( $example_cap->boat(), 'wingy', "Boat is correct." );
@@ -159,7 +161,7 @@ sub t031_basic_object : Test(3) {    #{{{
 
 sub t032_object_long_form : Test(2) {    #{{{
     my $self          = shift;
-    my $hessian_data1 = "O\x90\x05green\x05civic";
+    my $hessian_data1 = "o\x90\x05green\x05civic";
     my $example_car   = $self->class_instance_generator($hessian_data1);
 
     is( $example_car->model(), 'civic', "Correct car from referenced class." );
@@ -171,8 +173,7 @@ sub t033_retrieve_object_from_reference : Test(2) {    #{{{
     my $last_index = scalar @{ $self->{deserializer}->reference_list() } - 1;
     Hessian::Serializer->meta()->apply($self->{deserializer});
     my $hessian_integer = $self->{deserializer}->serialize_chunk($last_index);
-
-    my $hessian_data = "\x51" . $hessian_integer;
+    my $hessian_data = "\x4a\x0a";
     my $example_car =
       $self->{deserializer}
       ->deserialize_data( { input_string => $hessian_data } );
