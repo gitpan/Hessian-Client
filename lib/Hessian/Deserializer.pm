@@ -4,6 +4,8 @@ use Moose::Role;
 use version; our $VERSION = qv('0.0.1');
 use YAML;
 
+
+
 with qw/
   Hessian::Deserializer::Numeric
   Hessian::Deserializer::String
