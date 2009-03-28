@@ -35,7 +35,9 @@ t/01_translate/30_message.t
 t/01_translate/32_v1_message.t
 t/02_serialize/10_v1_client.t
 t/02_serialize/20_v2_client.t
+t/02_serialize/25_test_servlet_comm.t
 t/lib/Communication.pm
+t/lib/Communication/TestServlet2.pm
 t/lib/Communication/v1Serialization.pm
 t/lib/Communication/v2Serialization.pm
 t/lib/Datatype.pm
