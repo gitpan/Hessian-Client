@@ -3,7 +3,7 @@ package Hessian::Client;
 use strict;
 use warnings;
 
-use version; our $VERSION = qv('0.1.9');
+use version; our $VERSION = qv('0.1.10');
 
 use LWP::UserAgent;
 use HTTP::Request;
@@ -17,7 +17,8 @@ use Class::Std;
 
     sub BUILD {    #{{{
         my ( $self, $id, $args ) = @_;
-        my $hessian = Hessian::Translator->new( version => $args->{version} );
+        my $hessian = Hessian::Translator->new( version =>
+        $self->get_version() );
         $self->set_translator($hessian);
     }    #}}}
 
