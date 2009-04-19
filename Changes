@@ -1,6 +1,12 @@
 Revision history for Hessian::Client
 
 
+
+0.1.13 Sun Apr 19 2009
+        Want to see if the integer problems I'm having are due to endian-ness
+        of different platforms. Maybe having the error from the test display
+        the value for the particular platform might help.
+
 0.1.12 Sat Apr 4 2009
         Trying to debug some of the platform dependent problems that seem to
         be coming up.  Most of the CPAN Testers reports I've been getting say
