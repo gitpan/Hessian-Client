@@ -110,6 +110,11 @@ sub _read_quadruple_long_octet {    #{{{
 
 sub _read_quadruple_octet {    #{{{
     my $bytes = shift;
+    return unpack "l", pack "C*", reverse @{$bytes};
+}    #}}}
+
+sub _read_quadruple_float_octet {    #{{{
+    my $bytes = shift;
     {
         use integer;
 
@@ -134,7 +139,7 @@ sub _read_compact_double {    #{{{
     my @chars = unpack 'c*', $compact_octet;
     shift @chars;
     my $chars_size = scalar @chars;
-    my $float      = _read_quadruple_octet( \@chars );
+    my $float      = _read_quadruple_float_octet( \@chars );
     return $float;
 }    #}}}
 
