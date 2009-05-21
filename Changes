@@ -2,4 +2,6 @@ Revision history for Hessian-Client
 
 0.01    Thu May 21 21:55:03 UTC 2009
         First version, released on an unsuspecting world.
+0.02    Thu May 21 22:33:37 UTC 2009
+        fix reading of compact binary, in hessian 2.0
 

@@ -475,7 +475,7 @@ sub readBinary {
     my $len;
     for(substr $x,$i,1) {
         /[\x20-\x2f]/ && do {
-            $len = unpack('C',$_);
+            $len = unpack('C',$_)-0x20;
             return Hessian::Binary->new(data=>substr($x, $i+1, $len)), $i+1+$len;
         };
         /[\x34-\x37]/ && do {
