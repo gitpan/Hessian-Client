@@ -1,271 +1,282 @@
 package Hessian::Translator;
 
-use warnings;
-use strict;
+use Moose;
 
-use Math::BigInt;
+use Module::Load;
+use YAML;
+use List::MoreUtils qw/any/;
+use Config;
+#use Smart::Comments;
 
-my $UB32 = Math::BigInt->new(0x7fffffff);
-my $LB32 = Math::BigInt->new(-0x80000000);
+use Hessian::Exception;
+
+has 'is_big_endian'     => ( is => 'ro', isa => 'Bool', default => 0 );
+has 'original_position' => ( is => 'rw', isa => 'Int',  default => 0 );
+has 'class_definitions' => ( is => 'rw', default => sub { [] } );
+has 'type_list' => (    #{{{
+    is      => 'rw',
+    isa     => 'ArrayRef',
+    lazy    => 1,
+    default => sub { [] }
+);                      #}}}
+has 'reference_list' => ( is => 'rw', default => sub { [] } );
+has 'input_string' => (    #{{{
+    is  => 'rw',
+    isa => 'Str',
+);                         #}}}
+has 'version'     => ( is => 'ro', isa => 'Int' );
+has 'binary_mode' => ( is => 'ro', isa => 'Bool', default => 0 );
+has 'chunked'     => ( is => 'ro', isa => 'Bool', default => 0 );
+has 'serializer' => (
+    is  => 'rw',
+    isa => 'Bool',
+);
+has 'in_interior' => ( is => 'rw', isa => 'Bool', default => 0 );
+
+before 'input_string' => sub {    #{{{
+    my $self = shift;
+    if (  not $self->does('Hessian::Deserializer') ) {
+        load 'Hessian::Deserializer';
+        Hessian::Deserializer->meta()->apply($self);
+    }
+    $self->version();
+};    #}}}
+
+sub append_input_buffer {    #{{{
+    my ( $self, $hessian_string ) = @_;
+    if ( $self->{input_string} ) {
+        my $fh_pos = tell $self->input_handle();
+        my $input_string = substr $self->{input_string}, $fh_pos;
+
+        my $entire_string = $input_string . $hessian_string;
+        $self->input_string($entire_string);
+    }
+    else {
+        $self->input_string($hessian_string);
+    }
+}    #}}}
+
+before 'serializer' => sub {    #{{{
+    my $self = shift;
+    if ( !$self->does('Hessian::Serializer') ) {
+        load 'Hessian::Serializer';
+        Hessian::Serializer->meta()->apply($self);
+    }
+    $self->version();
+};    #}}}
+
+after 'version' => sub {    #{{{
+    my ($self) = @_;
+    my $version = $self->{version};
+  PROCESSVERSION: {
+        last PROCESSVERSION unless $version;
+        Parameter::X->throw( error => "Version should be either 1 or 2." )
+          if $version !~ /^(?:1|2)$/;
+        last PROCESSVERSION
+          if $self->does('Hessian::Translator::V1')
+              or $self->does('Hessian::Translator::V2');
+        last PROCESSVERSION
+          if not(    $self->does('Hessian::Serializer')
+                  or $self->does('Hessian::Deserializer') );
+        my $version_role = 'Hessian::Translator::V' . $version;
+        load $version_role;
+        $version_role->meta()->apply($self);
+    }    #PROCESSVERSION
+};    #}}}
+
+sub read_from_inputhandle {    #{{{
+    my ( $self, $read_length ) = @_;
+    ### Reading from input handle: $read_length;
+
+    my $input_handle = $self->input_handle();
+    binmode( $input_handle, 'bytes' );
+    my $original_pos            = $self->original_position();
+    my $current_position        = ( tell $input_handle ) - 1;
+    my $sub_string              = $self->{input_string};
+    my $remaining_string_buffer = substr $self->{input_string},
+      $current_position;
+
+    my $remaining_length = length $remaining_string_buffer;
+    ### remaining: $remaining_length
+    my $result;
+    if ( $read_length > $remaining_length ) {
+
+        # Set filehandle back to the original position
+        my $message =
+            "Input buffer does not contain"
+          . " a complete message.\n$remaining_string_buffer\n"
+          . "Current position $current_position\n"
+          . "read length: $read_length\nremaining: $remaining_length\n"
+          . "string: "
+          . $self->{input_string} . ".\n";
+
+        #          print $message;
+
+        #        seek $input_handle, $original_pos, 0;
+        # Throw an exception that will be caught by the caller
+        MessageIncomplete::X->throw( error => $message );
+    }
+    else {
+        read $self->input_handle(), $result, $read_length;
+    }
+    return $result;
+
+}    #}}}
+
+sub set_current_position {    #{{{
+    my ( $self, $offset ) = @_;
+    my $input_handle     = $self->input_handle();
+    my $current_position = ( tell $input_handle ) + $offset;
+    $self->original_position($current_position);
+}    #}}}
+
+sub BUILD {    #{{{
+    my ( $self, $params ) = @_;
+    load 'Hessian::Translator::Composite';
+    Hessian::Translator::Composite->meta()->apply($self);
+    if ( any { defined $params->{$_} } qw/input_string input_handle/ ) {
+        load 'Hessian::Deserializer';
+        Hessian::Deserializer->meta()->apply($self);
+
+    }
+
+    if ( any { defined $params->{$_} } qw/service/ ) {
+        load 'Hessian::Serializer';
+        Hessian::Serializer->meta()->apply($self);
+    }
+    $self->version();
+    my $byteorder = $Config{byteorder};
+    $self->is_big_endian(1) if $byteorder =~ /4321/;
+
+}    #}}}
+
+"one, but we're not the same";
+
+__END__
+
 
 =head1 NAME
 
-Hessian::Translator - The great new Hessian::Translator!
+Hessian::Translator - Base class for Hessian serialization/deserialization.
 
-=head1 VERSION
+=head1 SYNOPSIS
 
-Version 0.01
+    my $translator = Hessian::Translator->new( version => 1 );
 
-=cut
+    my $hessian_string = "S\x00\x05hello";
+    $translator->input_string($hessian_string);
+    my $output = $translator->deserialize_message();
 
-our $VERSION = '0.01';
+
+    # Apply serialization methods to the object.
+    Hessian::Serializer->meta()->apply($translator);
+
+=head1 DESCRIPTION
+
+B<Hessian::Translator> and associated subclasses and roles provides
+serialization/deserialization of data and Perl datastructures into Hessian
+protocol.  
+
+On its own, this class really only provides some of the more basic functions
+required for Hessian processing such as the I<type list> for datatypes, the
+I<reference list> for maps, objects and arrays; and the I<object class
+definition list>.  Integration of the respective serialization and
+deserialization behaviours only takes place when needed. Depending on how
+the translator is initialized and which methods are called on the object, it
+is possibly to specialize the object for either Hessian 1.0 or Hessian 2.0
+processing and to selectively include methods for serialization and or
+deserialization.  
 
 
 
-=head1 FUNCTIONS
+=head1 INTERFACE
+
+
+=head2 BUILD
+
+Not to be called directly.  Pod::Coverage complains if I don't have it in here
+though.
+
 
 =head2 new
 
-=cut
 
-sub new {
-    my($class,@params) = @_;
+=over 2
 
-    my %h = @params;
-    my $self = \%h;
+=item
+version
 
-    #these will be used
-    $self->{_out} = '';            # call string
-    $self->{_in} = '';             # reply string
-    $self->{_outRefs} = [];   # ref list for writing call
-    $self->{_inRefs} = [];    # ref list for parsing reply
+Allowed values are B<1> or B<2> and correspond to the respective Hessian
+protocol version.
 
-    $self->{_inList} = [];    # reply parsed into perl structure
-    $self->{_inHeaders} = []; # reply headers, if used
-
-    # Hessian 2.0 use only
-    $self->{_outClassRefs} = []; # class def, Hessian 2.0
-    $self->{_inClassRefs} = []; # class def, Hessian 2.0
-    $self->{_inTypeRefs} = []; # type, for list/map
-
-    bless $self,$class;
-    return $self;
-}
-
-=head2 pack_signed_int
-
-=cut
-
-sub pack_signed_int {
-    my($self,$x,$n) = @_; #$n = bytes
-    $n *= 2; # nybbles = 4-bit
-    $x = Math::BigInt->new($x) unless ref($x) eq 'Math::BigInt';
-    my $y = $x->as_hex();
-    if($x->is_neg()){ #two's complement ...
-        my $u = Math::BigInt->new('0x'.'f'x$n);
-        $y = $x->bneg()->bxor($u)->binc()->as_hex();
-    }
-    $y = sprintf "%0${n}s",substr $y,2; #remove leading '0x' and pad with 0
-    $y =~ s/([0-9a-f]{2})/pack('H2',$1)/gei;
-    return $y;
-}
-
-=head2 unpack_int
-
-=cut
-
-sub unpack_int {
-    my($self,$x,$i,$len,$signed) = @_; #len in bytes
-    my $n = $len * 2;
-    $x = substr $x,$i,$len;
-    $x =~ s/(.)/sprintf('%02x',ord $1)/ge;
-    $x = Math::BigInt->new("0x$x");
-
-    my $y = Math::BigInt->new('0x7'.'f'x($n-1));
-    if($signed && $signed !~ /^unsigned$/i && 0 < $x->bcmp($y)){ #signed & negative
-        my $u = Math::BigInt->new('0x1'.'0'x$n);
-        $x->bsub($u);
-    }
-    return $x;
-}
-
-=head2 is_between
-
-=cut
-
-sub is_between {
-    my($self,$x,$l,$u) = @_;
-    return $x >= $l && $x <= $u unless ref $x || ref $l || ref $u;
-    $x = Math::BigInt->new($x) unless ref $x;
-    $l = Math::BigInt->new($l) unless ref $l;
-    $u = Math::BigInt->new($u) unless ref $u;
-    return 0 <= $x->bcmp($l) && 0 >= $x->bcmp($u) if 'Math::BigInt' eq ref $x;
-}
-
-=head2 h2n
-
-=cut
-
-sub h2n { # host 2 network byte order, or n2h
-    my($self,$bytes) = @_;
-    use Config;
-    return $Config{'byteorder'} =~ /^1234/ # little-endian
-    ? scalar reverse $bytes
-    : $bytes;
-}
-
-=head2 bin_debug
-
-=cut
-
-sub bin_debug {
-    my($self, $octets) = @_;
-
-    my($cnt,$out) = (1,'');
-    for(split//,$octets){
-        if( $_ =~ /^[a-zA-Z0-9]/ ){ #newer perl would take /\p{IsGraph}/ ...
-            $out .= "$_ ";
-        }elsif( $_ =~ /^[\`\~\!\@\#\$\%\^\&\*\(\)\-\_\=\+\[\{\]\}\;\:\'\"\,\<\.\>\/\?]/ ){ #newer perl would take /\p{IsGraph}/ ...
-            $out .= "'$_' ";
-        }else{
-            $out .= sprintf 'x%02x ', ord($_);
-        }
-        $out .= "\n" if 0 == $cnt++ % 30;
-    }
-    $out .= "\n";
-}
-
-=head2 debug
-
-=cut
-
-sub debug {
-    my($self, @msgs) = @_;
-    print STDERR "@msgs\n" if $self->{debug};
-}
-
-=head2 dump_fault
-
-=cut
-
-sub dump_fault {
-    my($self,$f) = @_;
-    return unless 'Hessian::Fault' eq ref $f;
-    my $stack = join "\n", map{
-        join ' ',$_->{__type},$_->{lineNumber},$_->{fileName},"$_->{methodName}()",$_->{declaringClass}
-    } grep{'HASH' eq ref $_}@{$f->{detail}->{stackTrace}};
-    my $reply = <<EOFAULT;
-Hessian::Fault code: $f->{code}
-  message: $f->{message}
-  detail: $f->{detail}->{__type}: $f->{detail}->{detailMessage}
-  $stack
-EOFAULT
-    print STDERR Data::Dumper::Dumper($reply);
-    return $reply;
-}
-
-=head2 mangle
-
-=cut
-
-sub mangle {
-    my($self,$method,@params) = @_;
-    my @pnames = map $self->type_of($_), @params;
-    return join '_', $method, @pnames;
-}
-
-=head2 type_of
-
-=cut
-
-sub type_of {
-    my($self,$x) = @_;
-    for(ref $x){
-        /^Hessian::Null/        && return 'null';
-        /^Hessian::Double/      && return 'double';
-        /^Hessian::Long/        && return 'long';
-        /^DateTime/             && return 'date';
-        /^Unicode::String/      && return 'string';
-        /^Hessian::Binary/      && return 'binary';
-        /^Hessian::XML/         && return 'xml'; # hessian 1.0 only ?
-        /^Hessian::(True|False)/        && return 'boolean';
-        /^(Hessian::List|ARRAY)/        && return $x->{type} ? $x->{type} : 'list';
-        /^(Hessian::Map|HASH)$/ && return $x->{type} ? $x->{type} : 'map';
-        /^Hessian::Remote/      && return 'remote';
-        /^REF$/                 && return $self->type_of($$x); # perl ref
-        /^$/                    && do {
-                                    for($x){
-                                        /^[\+-]?\d+$/
-                                        && do { # int or long
-                                            $x = Math::BigInt->new($x);
-                                            return $self->is_between($x,$LB32,$UB32) ? 'int' : 'long';
-                                        };
-                                        /^[\+-]?(\d+\.|\.\d+)$/ && return 'double';
-                                        m!<\?xml version="\d+" .*\?>! && return 'xml';
-                                        # default
-                                        return 'string';
-                                    } # end for $x
-                                };
-        # DEFAULT
-        #die "unkown type_of $x: ", ref $x;
-        return 'Object'; # ??
-    } # end for ref $x
-}
-
-=head1 AUTHOR
-
-du ling, C<< <ling.du at gmail.com> >>
-
-=head1 BUGS
-
-Please report any bugs or feature requests to C<bug-hessian-translator at rt.cpan.org>, or through
-the web interface at L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=Hessian-Client>.  I will be notified, and then you'll
-automatically be notified of progress on your bug as I make changes.
-
-
-
-
-=head1 SUPPORT
-
-You can find documentation for this module with the perldoc command.
-
-    perldoc Hessian::Client
-
-
-You can also look for information at:
-
-=over 4
-
-=item * RT: CPAN's request tracker
-
-L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Hessian-Client>
-
-=item * AnnoCPAN: Annotated CPAN documentation
-
-L<http://annocpan.org/dist/Hessian-Client>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/Hessian-Client>
-
-=item * Search CPAN
-
-L<http://search.cpan.org/dist/Hessian-Client>
 
 =back
 
 
-=head1 ACKNOWLEDGEMENTS
+=head2 input_string
+
+=over 2
+
+=item
+string
+
+The Hessian encoded string to be decoded.  This may represent an entire
+message or a simple scalar or datastructure. Note that the first application
+of this method causes the L<Hessian::Deserializer> role to be applied to this
+class.
 
 
-=head1 COPYRIGHT & LICENSE
-
-Copyright 2009 du ling, all rights reserved.
-
-This program is free software; you can redistribute it and/or modify it
-under the same terms as Perl itself.
+=back
 
 
-=cut
+=head2 version
 
-1; # End of Hessian::Translator
+Retrieves the current version for which this client was initialized. See
+L</"new">.
+
+=head2 append_input_buffer
+
+Appends the string parameter to the filehandle.
+
+
+=head2 class_definitions
+
+Provides access to the internal class definition list.
+
+
+=head2 type_list
+
+Provides access to the internal type list.
+
+=head2 reference_list
+
+Provides access to the internal list of references.
+
+
+=head2 serializer
+
+Causes the L<Hessian::Serializer|Hessian::Serializer> methods to be applied to
+the current object.
+
+=head2 read_from_inputhandle
+
+Reads a specified number of bytes from an input stream.
+
+=head2 set_current_position
+
+Set/reset the current position in an input stream.
+
+
+=head1 DEPENDENCIES
+
+
+
+=over 2
+
+
+=item
+L<Moose|Moose>
+
+
+
+=back

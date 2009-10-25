@@ -1,782 +1,541 @@
 package Hessian::Translator::V2;
 
-use warnings;
-use strict;
+use Moose::Role;
 
-our @ISA = qw(Hessian::Translator);
+use Switch;
+use YAML;
+use Hessian::Exception;
+use Hessian::Simple;
+#use Smart::Comments;
 
-use DateTime;
-use Unicode::String;
-use Math::BigInt;
+has 'string_chunk_prefix'       => ( is => 'ro', isa => 'Str', default => 'R' );
+has 'string_final_chunk_prefix' => ( is => 'ro', isa => 'Str', default => 'S' );
+has 'end_of_datastructure_symbol' =>
+  ( is => 'ro', isa => 'Str', default => 'Z' );
 
-use Hessian::Translator;
-use Hessian::Type;
+sub read_message_chunk_data {    #{{{
+    my ( $self, $first_bit ) = @_;
+    my $datastructure;
+    ### message chunk data
+    ### first bit: $first_bit
+    switch ($first_bit) {
+        case /\x48/ {            # TOP with version#{{{
+            $self->in_interior(0);
+            if ( $self->chunked() ) {    # use as hashmap if chunked
+                my $params = { first_bit => $first_bit };
+                $datastructure = $self->deserialize_data($params);
+            }
+            else {
+                ### reading version
+                my $hessian_version = $self->read_version();
+                $datastructure = { hessian_version => $hessian_version };
+            }
+        }    #}}}
 
-my $UB32 = Math::BigInt->new(0x7fffffff);
-my $LB32 = Math::BigInt->new(-0x80000000);
+       #        case /\x43/ {                    # Hessian Remote Procedure Call
+       #            if ( $self->in_interior() ) {
+
+        #                my $params = { first_bit => $first_bit };
+        #                $datastructure = $self->deserialize_data($params);
+        #            }
+        #            else {
+
+#          # call will need to be dispatched to object designated in some kind of
+#          # service descriptor
+#                my $rpc_data = $self->read_rpc();
+#                $datastructure = { call => $rpc_data };
+
+        #            }
+        #        }
+        case /\x45/ {    # Envelope
+            $datastructure = $self->read_envelope();
+        }
+        case /\x46/ {    # Fault
+            $self->in_interior(1);
+            my $result                = $self->deserialize_data();
+            my $exception_name        = $result->{code};
+            my $exception_description = $result->{message};
+            $exception_name->throw( error => $exception_description );
+        }
+        case /\x52/ {    # Reply
+            $self->in_interior(1);
+            my $reply_data = $self->deserialize_data();
+            $datastructure = { reply_data => $reply_data };
+        }
+        else {
+            my $params = { first_bit => $first_bit };
+            $datastructure = $self->deserialize_data($params);
+        }
+    }
+    return $datastructure;
+}    #}}}
+
+sub read_composite_data {    #{{{
+    my ( $self, $first_bit ) = @_;
+    my ( $datastructure, $save_reference );
+    switch ($first_bit) {
+        case /[\x55\x56\x70-\x77]/ {    # typed lists
+            push @{ $self->reference_list() }, [];
+            $datastructure = $self->read_typed_list( $first_bit, );
+        }
+
+        case /[\x57\x58\x78-\x7f]/ {    # untyped lists
+            push @{ $self->reference_list() }, [];
+            $datastructure = $self->read_untyped_list( $first_bit, );
+        }
+        case /\x48/ {
+            push @{ $self->reference_list() }, {
+            };
+            $datastructure = $self->read_map_handle();
+        }
+        case /\x4d/ {                   # typed map
+
+            push @{ $self->reference_list() }, {
+            };
+
+            # Get the type for this map. This seems to be more like a
+            # perl style object or "blessed hash".
+
+            my $entity_type = $self->read_hessian_chunk();
+            my $map_type    = $self->store_fetch_type($entity_type);
+            my $map         = $self->read_map_handle();
+            $datastructure = bless $map, $map_type;
+
+        }
+        case /[\x43\x4f\x60-\x6f]/ {
+            if ( $first_bit !~ /\x43/ ) {
+                push @{ $self->reference_list() }, {
+                };
+                $datastructure = $self->read_class_handle( $first_bit, );
+            }
+            else {
+                $self->read_class_handle( $first_bit, );
+                return;
+            }
+
+        }
+    }
+
+    #    push @{ $self->reference_list() }, $datastructure
+    #      if $save_reference;
+    return $datastructure;
+
+}    #}}}
+
+sub read_typed_list {    #{{{
+    my ( $self, $first_bit ) = @_;
+    my $entity_type   = $self->read_hessian_chunk();
+    my $type          = $self->store_fetch_type($entity_type);
+    my $array_length  = $self->read_list_length($first_bit);
+    my $datastructure = $self->reference_list()->[-1];
+    my $index         = 0;
+  LISTLOOP:
+    {
+        last LISTLOOP if ( $array_length and ( $index == $array_length ) );
+        my $element;
+        eval { $element = $self->read_typed_list_element($type); };
+        if ( my $e = $@ ) {
+            if ( $e->isa('MessageIncomplete::X')
+                or ( $first_bit =~ /\x55/ and $e->isa('EndOfInput::X') ) )
+            {
+                last LISTLOOP;
+            }
+        }
+
+        push @{$datastructure}, $element;
+        $index++;
+        redo LISTLOOP;
+    }
+    return $datastructure;
+}    #}}}
+
+sub read_class_handle {    #{{{
+    my ( $self, $first_bit ) = @_;
+    my ( $save_reference, $datastructure );
+    switch ($first_bit) {
+        case /\x43/ {      # Read class definition
+            my $class_type = $self->read_hessian_chunk();
+            $class_type =~ s/\./::/g;    # get rid of java stuff
+                                         # Get number of fields
+            $self->store_class_definition($class_type);
+
+            return;
+
+       #            $datastructure = $self->store_class_definition($class_type);
+        }
+        case /\x4f/ {    # Read hessian data and create instance of class
+            $save_reference = 1;
+            $datastructure  = $self->fetch_class_for_data();
+        }
+        case /[\x60-\x6f]/ {    # The class definition is in the ref list
+            $save_reference = 1;
+            my $hex_bit = unpack 'C*', $first_bit;
+            my $class_definition_number = $hex_bit - 0x60;
+            $datastructure = $self->instantiate_class($class_definition_number);
+        }
+    }
+
+    #    push @{ $self->reference_list() }, $datastructure
+    #      if $save_reference;
+    return $datastructure;
+}    #}}}
+
+sub read_map_handle {    #{{{
+    my $self = shift;
+
+    # For now only accept integers or strings as keys
+    my @key_value_pairs;
+  MAPLOOP:
+    {
+        my $key;
+        eval { $key = $self->read_hessian_chunk(); };
+        last if not $key or $key eq '';
+        last MAPLOOP
+          if ( Exception::Class->caught('EndOfInput::X')
+            or Exception::Class->caught('MessageIncomplete::X') );
+        my $value = $self->read_hessian_chunk();
+        push @key_value_pairs, $key => $value;
+        redo MAPLOOP;
+    }
+
+    # should throw an exception if @key_value_pairs has an odd number of
+    # elements
+    my $hash          = {@key_value_pairs};
+    my $datastructure = $self->reference_list()->[-1];
+    foreach my $key ( keys %{$hash} ) {
+        $datastructure->{$key} = $hash->{$key};
+    }
+    return $datastructure;
+
+}    #}}}
+
+sub read_untyped_list {    #{{{
+    my ( $self, $first_bit ) = @_;
+    my $array_length  = $self->read_list_length( $first_bit, );
+    my $datastructure = [];
+    my $index         = 0;
+  LISTLOOP:
+    {
+        last LISTLOOP if ( $array_length and ( $index == $array_length ) );
+        my $element;
+        eval { $element = $self->read_hessian_chunk(); };
+        if ( my $e = $@ ) {
+            if ( $e->isa('MessageIncomplete::X')
+                or ( $first_bit =~ /\x57/ and $e->isa('EndOfInput::X') ) )
+            {
+                last LISTLOOP;
+            }
+        }
+        if ( defined $element ) {
+            push @{$datastructure}, $element;
+            $index++;
+
+        }
+        redo LISTLOOP;
+    }
+    return $datastructure;
+}    #}}}
+
+sub read_simple_datastructure {    #{{{
+    my ( $self, $first_bit ) = @_;
+    my $element;
+    switch ($first_bit) {
+        case /\x4e/ {              # 'N' for NULL
+            $element = undef;
+        }
+        case /[\x46\x54]/ {        # 'T'rue or 'F'alse
+            $element = $self->read_boolean_handle_chunk($first_bit);
+        }
+        case /[\x49\x80-\xbf\xc0-\xcf\xd0-\xd7]/ {
+            $element = $self->read_integer_handle_chunk($first_bit);
+        }
+        case /[\x4c\x59\xd8-\xef\xf0-\xff\x38-\x3f]/ {
+            $element = $self->read_long_handle_chunk($first_bit);
+        }
+        case /[\x44\x5b-\x5f]/ {
+            $element = $self->read_double_handle_chunk($first_bit);
+        }
+        case /[\x4a\x4b]/ {
+            $element = $self->read_date_handle_chunk($first_bit);
+        }
+        case /[\x52\x53\x00-\x1f\x30-\x33]/ {    #   for version 1: \x73
+            $element = $self->read_string_handle_chunk($first_bit);
+        }
+        case /[\x41\x42\x20-\x2f]/ {
+            $element = $self->read_binary_handle_chunk($first_bit);
+        }
+        case /[\x43\x4d\x4f\x48\x55-\x58\x60-\x6f\x70-\x7f]/
+        {                                        # recursive datastructure
+            $element = $self->read_composite_datastructure( $first_bit, );
+        }
+        case /\x51/ {
+            my $reference_id = $self->read_hessian_chunk();
+            $element = $self->reference_list()->[$reference_id];
+
+        }
+    }
+    return $element;
+
+}    #}}}
+
+sub read_rpc {    #{{{
+    my $self      = shift;
+    my $call_data = {};
+    my $call_args;
+    my $method_name = $self->read_hessian_chunk();
+    $call_data->{method} = $method_name;
+    my $number_of_args = $self->read_hessian_chunk();
+    foreach ( 1 .. $number_of_args ) {
+        my $argument = $self->read_hessian_chunk();
+        push @{$call_args}, $argument;
+    }
+    $call_data->{arguments} = $call_args;
+    return $call_data;
+
+}    #}}}
+
+sub write_hessian_hash {    #{{{
+    my ( $self, $datastructure ) = @_;
+    my $anonymous_map_string = "H";    # start an anonymous hash
+    foreach my $key ( keys %{$datastructure} ) {
+        my $hessian_key   = $self->write_scalar_element($key);
+        my $value         = $datastructure->{$key};
+        my $hessian_value = $self->write_hessian_chunk($value);
+        $anonymous_map_string .= $hessian_key . $hessian_value;
+    }
+    $anonymous_map_string .= $self->end_of_datastructure_symbol();
+    return $anonymous_map_string;
+}    #}}}
+
+sub write_typed_map {    #{{{
+    my ( $self, $datastructure ) = @_;
+    my $type             = ref $datastructure;
+    my $hessian_type     = $self->write_scalar_element($type);
+    my $typed_map_string = 'M' . $hessian_type;
+
+    foreach my $key ( keys %{$datastructure} ) {
+        my $hessian_key   = $self->write_scalar_element($key);
+        my $value         = $datastructure->{$key};
+        my $hessian_value = $self->write_hessian_chunk($value);
+        $typed_map_string .= $hessian_key . $hessian_value;
+    }
+    $typed_map_string .= $self->end_of_datastructure_symbol();
+    return $typed_map_string;
+}    #}}}
+
+sub write_hessian_array {    #{{{
+    my ( $self, $datastructure ) = @_;
+    my $anonymous_array_string = "\x57";
+    foreach my $element ( @{$datastructure} ) {
+        my $hessian_element = $self->write_hessian_chunk($element);
+        $anonymous_array_string .= $hessian_element;
+    }
+    $anonymous_array_string .= "Z";
+    return $anonymous_array_string;
+}    #}}}
+
+sub write_hessian_string {    #{{{
+    my ( $self, $chunks ) = @_;
+    return $self->write_string( { chunks => $chunks } );
+
+}    #}}}
+
+sub write_object {    #{{{
+    my ( $self, $datastructure ) = @_;
+    return $self->write_typed_map($datastructure);
+#    my $type              = ref $datastructure;
+#    my @fields            = keys %{$datastructure};
+#    my @class_definitions = @{ $self->class_definitions() };
+#    {
+#        ## no critic
+#        no strict 'refs';
+#        push @{ $type . '::ISA' }, 'Hessian::Simple';
+#        ## use critic
+#    }
+#    foreach my $field (@fields) {
+#        $datastructure->meta()->add_attribute( $field, is => 'rw' );
+#    }
+#    my ( $hessian_string, $class_already_stored );
+#    my $index = 0;
+#    foreach my $class_def (@class_definitions) {
+#        my $defined_type = $class_def->{type};
+#        if ( $defined_type eq $type ) {
+#            $class_already_stored = 1;
+#            last;
+#        }
+#        $index++;
+#    }
+#    if ( not $class_already_stored ) {
+#        my $hessian_type = $self->write_scalar_element($type);
+#        $hessian_string = "C" . $hessian_type;
+#        my $num_of_fields = scalar @fields;
+#        $hessian_string .= ( $self->write_scalar_element($num_of_fields) );
+#        foreach my $field (@fields) {
+#            my $hessian_field = $self->write_scalar_element($field);
+#            $hessian_string .= $hessian_field;
+#        }
+#        my $store_definition = { type => $type, fields => \@fields };
+#        push @{ $self->class_definitions() }, $store_definition;
+#        $index = ( scalar @{ $self->class_definitions } ) - 1;
+#    }
+#    $hessian_string .= 'O';
+#    $hessian_string .= ( $self->write_scalar_element($index) );
+#    foreach my $field (@fields) {
+#        my $value = $datastructure->$field();
+
+#        #        my $value = $datastructure->{$field};
+#        $hessian_string .= ( $self->write_scalar_element($value) );
+#        ### hessian_string: $hessian_string
+#    }
+#    return $hessian_string;
+}    #}}}
+
+sub write_referenced_data {    #{{{
+    my ( $self, $index ) = @_;
+    my $hessian_string = "\x51";
+    my $hessian_index  = $self->write_scalar_element($index);
+    $hessian_string .= $hessian_index;
+    return $hessian_string;
+}    #}}}
+
+sub write_hessian_call {    #{{{
+    my ( $self, $datastructure ) = @_;
+    my $hessian_call   = "C";
+    my $method         = $datastructure->{method};
+    my $hessian_method = $self->write_scalar_element($method);
+    $hessian_call .= $hessian_method;
+    my $arguments   = $datastructure->{arguments};
+    my $num_of_args = scalar @{$arguments};
+    my $hessian_num = $self->write_scalar_element($num_of_args);
+    $hessian_call .= $hessian_num;
+
+    foreach my $argument ( @{$arguments} ) {
+        my $hessian_arg = $self->write_hessian_chunk($argument);
+        $hessian_call .= $hessian_arg;
+    }
+    return $hessian_call;
+}    #}}}
+
+sub serialize_message {    #{{{
+    my ( $self, $datastructure ) = @_;
+    my $result = $self->write_hessian_message($datastructure);
+    ### result: $result
+    return $result if $self->chunked();
+    my $message = "H\x02\x00" . $result;
+    return $message;
+}    #}}}
+
+"one, but we're not the same";
+
+__END__
+
 
 =head1 NAME
 
-Hessian::Translator::V2 - The great new Hessian::Translator::V2!
+Hessian::Translator::V2 - Translate datastructures to and from Hessian 2.0.
 
 =head1 VERSION
 
-Version 0.01
+=head1 SYNOPSIS
 
-=cut
+=head1 DESCRIPTION
 
-our $VERSION = '0.01';
+=head1 INTERFACE
 
 
-=head1 FUNCTIONS
+=head2 read_class_handle
 
-=head2 writeCall
+Read a class definition from the Hessian stream and possibly create an object
+from the definition and given parameters.
 
-=cut
+=head2 read_composite_data
 
-sub writeCall {
-    my ($self, $method, @params) = @_;
+Read Hessian 2.0 specific datastructures from the stream.
 
-    $method = $self->mangle($method,@params) if $self->{mangle}; # not working well (nor clear in specs), so don't use
-    my $x = 'H'
-    . pack('C2', 2, 0)
-    . 'C'
-    . $self->typeformat( Unicode::String->new($method) )
-    . $self->typeformat( scalar @params )
-    . join('', map($self->typeformat($_), @params));
+=head2 read_map_handle
 
-    $self->{_out} = $x; # save
-#    $self->debug($self->bin_debug($x));
-    return $x;
-}
+Read a map (perl HASH) from the stream.
 
-=head2 mangle
+=head2 read_message_chunk_data
 
-=cut
+Read Hessian 2.0 envelope.  For version 2.0 of the protocol this applies to
+I<envelope>, I<packet>, I<reply>, I<call> and I<fault> objects.
 
-sub mangle {
-    my($self,$method,@params) = @_;
-    my @pnames = map $self->type_of($_), @params;
-    return join '_', $method, @pnames;
-}
 
-=head2 typeformat
+=head2 read_rpc
 
-=cut
+Read a remote procedure call from the input stream.
 
-sub typeformat {
-    my($self, $x) = @_;
-    return 'N' unless defined $x; # Hessian::Null
-    push @{$self->{_outRefs}}, $x if ref($x) =~ /^(ARRAY|HASH|Hessian::(List|Map|Object))$/;
-    for(ref $x){
-        /^Hessian::Null/        && return 'N';
-        /^Hessian::True/        && return 'T';
-        /^Hessian::False/       && return 'F';
-        /^DateTime$/            && return $self->writeDate($x);
-        /^Math::BigInt/         && return $self->writeLong($x);
-        /^Hessian::Double/      && return $self->writeDouble($x);
-        /^Unicode::String/      && return $self->writeString($x);
-        /^Hessian::Binary/      && return $self->writeBinary($x);
-        /^Hessian::List/        && return $self->writeList($x);
-        /^ARRAY$/               && return $self->writeList(Hessian::List->new(len=>scalar(@$x),data=>$x));
-        /^Hessian::Map/         && return $self->writeMap($x);
-        /^HASH$/                && return $self->writeMap($x);
-        /^Hessian::Class/       && return $self->writeClass($x);
-        /^Hessian::Object/      && return $self->writeObject($x);
-        /^REF$/                 && return $self->writeRef($x);
-        /^.+$/                  && die "typeformat unknown type $x:", ref $x;
-        /^$/                    && do { # guess primitives
-                                    for($x){
-                                        /^[\+-]?\d+$/ && return $self->writeInt($x);
-                                        /^[\+-]?(\d+\.|\.\d+)$/ && return $self->writeDouble($x);
-                                        # treat everything else as a string
-                                        return $self->writeString($x);
-                                    }
-                                };
-        # DEFAULT
-        die "typeformat stuck with ($x):", ref $x;
+=head2 read_simple_datastructure
 
-    } # end of for-switch
-}
+Read a scalar of one of the basic Hessian datatypes from the stream.  This can
+be one of: 
 
-=head2 writeDate
+=over 2
 
-=cut
+=item
+string
 
-sub writeDate {
-    my($self,$x) = @_;
-    $x = Math::BigInt->new($x->epoch());
+=item
+integer
 
-    my($q,$r) = $x->copy()->bdiv(60);
-    if($r->is_zero() && $self->is_between($q,$LB32,$UB32)){
-        return 'K' . (pack 'N', unpack 'L', pack 'l', $q->bstr());
-    }
-    $x->bmul(1000); # milliseconds
-    return 'J' . $self->pack_signed_int($x,8);
-}
+=item
+long
 
-=head2 writeInt
+=item
+double
 
-=cut
+=item
+boolean
 
-sub writeInt {
-    my($self,$x) = @_;
+=item
+null
 
-    my $b = Math::BigInt->new($x) unless 'Math::BigInt' eq ref $x;
-
-    if   ($self->is_between($b,-16,47)){ return pack 'C', $x+0x90 }
-    elsif($self->is_between($b,-0x800,0x7ff)){ return pack 'n', $x+0xc800 }
-    elsif($self->is_between($b,-0x40000,0x3ffff)){ return substr((pack 'N', $x+0xd40000), -3) }
-    elsif($self->is_between($b,$LB32,$UB32)){ return 'I' . pack 'N', unpack 'L', pack 'l', $x }
-    return $self->writeLong($b);
-}
-
-=head2 writeLong
-
-=cut
-
-sub writeLong {
-    my($self,$x) = @_;
-
-    $x = Math::BigInt->new($x) unless 'Math::BigInt' eq ref $x;
-    my $i = $x->bstr();
-
-    if   ($self->is_between($x,-8,15)){ return pack 'C', $i+0xe0 }
-    elsif($self->is_between($x,-0x800,0x7ff)){ return pack 'n', $i+0xf800 }
-    elsif($self->is_between($x,-262144,262143)){ return substr((pack 'N', $i+0x3c0000), -3) }
-    elsif($self->is_between($x,-0x80000000,0x7fffffff)){ return "Y" . pack 'N', unpack 'L', pack 'l', $i }
-    return 'L' . $self->pack_signed_int($x,8);
-}
-
-=head2 writeDouble
-
-=cut
-
-sub writeDouble {
-    my($self, $x) = @_;
-    $x = $x->{data} if 'Hessian::Double' eq ref $x;
-
-    my $milli = int($x * 1000);
-
-    #not writing compact 4 octet-double, how to know if $x fits in a 32-bit float?
-    if($x == int $x){ # probably not accurate, but doesn't matter
-        if($x == 0){ return '[' }
-        elsif($x == 1){ return "\\" }
-        elsif($self->is_between($x, -128, 127)){ return ']' . (pack 'c', $x) }
-        elsif($self->is_between($x, -0x8000, 0x7fff)){ return '^' . (pack 'n', unpack 'S', pack 's', $x) }
-    }elsif($milli * 0.001 == $x){ # compact double: float
-        return '_' . pack('N', unpack 'L', pack 'l', $milli);
-    }
-    return 'D' . $self->h2n(pack 'd',$x);
-}
-
-=head2 writeString
-
-=cut
-
-sub writeString {
-    my($self,$x) = @_;
-    $x = Unicode::String->new($x) unless 'Unicode::String' eq ref $x;
-
-    my $len = $x->length;
-    if($len < 32)         { return chr($len) . $x->as_string }
-    elsif($len < 1024)    { return pack('n', $len+0x3000) . $x->as_string }
-    elsif($len <= 0x7fff) { return 'S' . (pack 'n',$len) . $x->as_string }
-
-    my($str1,$str2);
-    $str1 = $x->substr(0,0x7fff);
-    $str2 = $x->substr(0x7fff,$x->length() - 0x7fff);
-    return "R\x7f\xff" . $str1->as_string() . $self->writeString($str2);
-}
-
-=head2 writeBinary
-
-=cut
-
-sub writeBinary {
-    my($self,$x) = @_;
-    $x = $x->{data} if 'Hessian::Binary' eq ref $x;
-
-    my $len = length $x;
-    if($len < 16){ return chr($len+0x20) . $x }
-    elsif($len < 1024){ return pack('n', $len+0x3400) . $x }
-    elsif($len <= 0x7fff){ return 'B' . pack('n', $len) . $x }
-
-    return "A\x7f\xff" . substr($x,0,0x7fff) . $self->writeBinary(substr $x, 0x7fff);
-}
-
-=head2 writeList
-
-=cut
-
-sub writeList {
-    my($self,$x) = @_;
-    #push @{$self->{_outRefs}}, $x;
-    my $ar = $x->{data};
-    if(defined $x->{len} && $x->{len} < 7){ # fixed-length compact
-        return pack('C',$x->{len}+(defined $x->{type} ? 0x70 : 0x78))
-        . (defined $x->{type} ? $self->writeString($x->{type}) : '')
-        . join('',map $self->typeformat($_), @$ar);
-    }elsif(defined $x->{len} && defined $x->{type}){
-        return 'V'
-        . $self->writeString($x->{type})
-        . $self->writeInt($x->{len})
-        . join('',map $self->typeformat($_), @$ar)
-    }elsif(defined $x->{len}){
-        return 'X'
-        . $self->writeInt($x->{len})
-        . join('',map $self->typeformat($_), @$ar)
-    }elsif(defined $x->{type}){
-        return 'U'
-        . $self->writeInt($x->{len})
-        . join('',map $self->typeformat($_), @$ar)
-        . 'Z';
-    }else{
-        return 'W'
-        . join('',map $self->typeformat($_), @$ar)
-        . 'Z';
-    }
-}
-
-=head2 writeMap
-
-=cut
-
-sub writeMap {
-    my($self,$x) = @_;
-    if('HASH' eq ref $x){
-        my @ar;
-        while(my($k,$v)=each(%$x)){
-            push @ar, Unicode::String->new($k);
-            push @ar, $v;
-        }
-        $x = Hessian::Map->new(data=>\@ar);
-    }
-    #push @{$self->{_outRefs}}, $x;
-    return (defined $x->{type} ? 'M' : 'H')
-    . (defined $x->{type} ? $self->writeString($x->{type}) : '')
-    . join('',map $self->typeformat($_), @{$x->{data}})
-    . 'Z';
-}
-
-=head2 writeClass
-
-=cut
-
-sub writeClass {
-    my($self,$x) = @_;
-
-    my $cdar = $self->{_outClassRefs};
-    my $out;
-
-    if('Hessian::Class' eq ref $x){
-        push @$cdar, $x;
-        return 'C'
-        . $self->writeString($x->{name})
-        . $self->writeInt(scalar @{$x->{fields}})
-        . join('',map($self->writeString($_), @{$x->{fields}}))
-        . ($#$cdar < 16
-            ? pack('C',($#$cdar + 0x60))
-            : ('O' . ($self->writeInt($#$cdar)))
-          );
-=comment
-    }elsif('REF' eq ref $x){
-        $x = $$x;
-        die "REF to Hessian::Class needed $x" unless 'Hessian::Class' eq ref $x;
-        die "Class def ref found before class def list populated $x" unless $#$cdar >= 0;
-        for(my $j = 0; $j <= $#$cdar; $j++){
-            if($cdar->[$j] == $x){
-                return $j < 16
-                ? pack('C',($#$cdar + 0x60))
-                : ('O' . ($self->writeInt($#$cdar)));
-            }
-        }
-        die "Class def ref not found in def list";
-=cut
-    }else{
-        die "unknown class type $x:", ref $x;
-    }
-
-
-}
-
-=head2 writeObject
-
-=cut
-
-sub writeObject {
-    my($self,$x) = @_;
-
-    #push @{$self->{_outRefs}}, $x;
-    return $self->writeClass($x->{class})
-    . join('',map($self->typeformat($_), @{$x->{data}}));
-}
-
-=head2 writeRef
-
-=cut
-
-sub writeRef {
-    my($self, $x) = @_;
-
-    my $ar = $self->{_outRefs};
-    for(my $j=0; $j <= $#$ar; $j++){
-        return 'Q' . $self->writeInt($j) if $$x == $ar->[$j];
-    }
-    die 'Ref not found in argument list';
-}
-
-=head2 parseResponse
-
-=cut
-
-sub parseResponse {
-    my($self, $x) = @_;
-
-    $self->{_in} = $x; # save
-
-    my $c = substr $x,3,1;
-    die "V2 reply version not H 0x2 0x0: ", $self->bin_debug(substr $x,0,3) unless $x =~ /^H\x02\x00/;
-    die "V2 reply not begin with R or F: $c, 0x", ord($c) unless $c eq 'R' or $c eq 'F';
-
-    my($data,$i,@list);
-    $i = 4;
-    while($i < length $x){
-        ($data,$i) = $self->readElement($x,$i);
-        push @list,$data;
-    }
-
-    die "parsing not end at end of response string $i: ",length $x unless $i == 1 + length $x || $i == length $x;
-    die "no element read from response" unless 0 < scalar @list;
-
-    if($c eq 'F'){
-        my $map = pop @list;
-        my %h = @{$map->{data}};
-        my $f = Hessian::Fault->new( %h );
-        unshift @list, $f;
-    }
-
-    $self->{_inList} = \@list;
-    return $self->{_inList}; # list should be: Header* (Fault | Object)
-}
-
-=head2 readElement
-
-=cut
-
-sub readElement { #deserialize
-    my($self,$x,$i) = @_;
-
-    my($data);
-    for(substr $x,$i,1){
-        if   (/N/)                               { return Hessian::Null->new(), $i+1 }
-        elsif(/T/)                               { return Hessian::True->new(), $i+1 }
-        elsif(/F/)                               { return Hessian::False->new(), $i+1 }
-        elsif(/[I\x80-\xbf\xc0-\xcf\xd0-\xd7]/)  { ($data,$i) = $self->readInt($x,$i) }
-        elsif(/[LY\x38-\x3f\xd8-\xef\xf0-\xff]/) { ($data,$i) = $self->readLong($x,$i) }
-        elsif(/[JK]/)                            { ($data,$i) = $self->readDate($x,$i) }
-        elsif(/[D\x5b-\x5f]/)                    { ($data,$i) = $self->readDouble($x,$i) }
-        elsif(/[AB\x20-\x2f\x34-\x37]/)          { ($data,$i) = $self->readBinary($x,$i) }
-        elsif(/[RS\x00-\x1f\x30-\x33]/)           { ($data,$i) = $self->readString($x,$i) }
-        elsif(/[UVWX\x70-\x77\x78-\x7f]/)         { ($data,$i) = $self->readList($x,$i) }
-        elsif(/[MH]/)                            { ($data,$i) = $self->readMap($x,$i) }
-        elsif(/Q/)                               { ($data,$i) = $self->readRef($x,$i) }
-        elsif(/C/)                               { ($data,$i) = $self->readClass($x,$i); return $self->readElement($x,$i) }
-        elsif(/[O\x60-\x6f]/)                    { ($data,$i) = $self->readObject($x,$i) }
-        # default
-        else{ die sprintf('Unrecognized element: x%x',ord substr $self->{_in},$i,1) }
-    }
-
-    return $data,$i;
-}
-
-=head2 readInt
-
-=cut
-
-sub readInt {
-    my($self,$x,$i) = @_;
-
-    for(substr $x,$i,1){
-        /[\x80-\xbf]/   && return unpack('C',$_)-0x90, $i+1;
-        /[\xc0-\xcf]/   && return unpack('n',substr $x,$i,2) - 0xc800, $i+2;
-        /[\xd0-\xd7]/   && return unpack('N',("\x00". substr($x,$i,3))) - 0xd40000, $i+3;
-        /I/             && return unpack('l',pack 'L',unpack 'N',(substr $x,$i+1,4)), $i+5;
-        die "Wrong: Int $_";
-    }
-}
-
-=head2 readLong
-
-=cut
-
-sub readLong {
-    my($self,$x,$i) = @_;
-
-    for(substr $x,$i,1){
-        /[\xd8-\xef]/   && return Math::BigInt->new(unpack('C',$_)-0xe0), $i+1;
-        /[\xf0-\xff]/   && return Math::BigInt->new(unpack('n',substr $x,$i,2) - 0xf800),$i+2;
-        /[\x38-\x3f]/   && return Math::BigInt->new(unpack('N',("\x00". substr($x,$i,3))) - 0x3c0000), $i+3;
-        /Y/             && return Math::BigInt->new(unpack 'l',pack 'L', unpack 'N', substr $x,$i+1,4), $i+5;
-        /L/             && return $self->unpack_int($x,$i+1,8,'signed'), $i+9;
-        die "Wrong: Long $_";
-    }
-}
-
-=head2 readDate
-
-=cut
-
-sub readDate {
-    my($self,$x,$i) = @_;
-
-    die "Wrong: date ", substr($x,$i,1) unless substr($x,$i,1) =~ /[JK]/;
-
-    my $epoch;
-    if('J' eq substr $x,$i,1){
-        $epoch = $self->unpack_int($x,$i+1,8,'signed');
-        $epoch->bdiv(1000);
-        $i+=9;
-    }else{
-        $epoch = unpack 'l', pack 'L', unpack 'N', (substr $x,$i+1,4);
-        $epoch = Math::BigInt->new($epoch);
-        $epoch->bmul(60);
-        $i+=5;
-    }
-    return DateTime->from_epoch(epoch => $epoch->bstr(), time_zone => 'UTC'),$i;
-}
-
-=head2 readDouble
-
-=cut
-
-sub readDouble {
-    my($self,$x,$i) = @_;
-
-    for(substr $x,$i,1){
-        /[\x5b]/ && return Hessian::Double->new(data=>'0.0'), $i+1;
-        /[\x5c]/ && return Hessian::Double->new(data=>'1.0'), $i+1;
-        /[\x5d]/ && return Hessian::Double->new(data=>unpack('c',(substr$x,$i+1,1))), $i+2;
-        /[\x5e]/ && return Hessian::Double->new(data=>unpack('s', pack 'S',unpack 'n',(substr $x,$i+1,2))), $i+3;
-        #/[\x5f]/ && return Hessian::Double->new(data=>unpack('f',$self->h2n(substr $x,$i+1,4))), $i+5;
-        /[\x5f]/ && return Hessian::Double->new(data=>0.001 * unpack('l',pack 'L',unpack 'N', substr($x,$i+1,4))), $i+5;
-        /D/      && return Hessian::Double->new(data=>unpack('d',$self->h2n(substr $x,$i+1,8))), $i+9;
-        die "Wrong: double $_";
-    }
-}
-
-=head2 readBinary
-
-=cut
-
-sub readBinary {
-    my($self,$x,$i) = @_;
-
-    my $len;
-    for(substr $x,$i,1) {
-        /[\x20-\x2f]/ && do {
-            $len = unpack('C',$_)-0x20;
-            return Hessian::Binary->new(data=>substr($x, $i+1, $len)), $i+1+$len;
-        };
-        /[\x34-\x37]/ && do {
-            $len = unpack('n',substr($x,$i,2))-0x3400;
-            return Hessian::Binary->new(data=>substr($x, $i+2, $len)), $i+2+$len;
-        };
-        /[B]/         && do {
-            $len = unpack 'n',substr($x,$i+1,2);
-            return Hessian::Binary->new(data=>substr($x, $i+3, $len)), $i+3+$len;
-        };
-        /[A]/         && do {
-            $len = unpack 'n',substr($x,$i+1,2);
-            my($y,$j) = $self->readBinary($x,$i+3+$len);
-            $y->{data} = substr($x, $i+3, $len) . $y->{data};
-            return $y, $j;
-        };
-        # default
-        die "Wrong: Binary $_";
-
-    }
-}
-
-=head2 readString
-
-=cut
-
-sub readString {
-    my($self,$x,$i) = @_;
-
-    my $len;
-    for(substr $x,$i,1) {
-        /[\x00-\x1f]/ && do {
-            $len = unpack 'C', $_;
-            return Unicode::String->new(substr $x,$i+1)->substr(0,$len), $i+1+$len;
-        };
-        /[\x30-\x33]/ && do {
-            $len = unpack('n', substr($x,$i,2)) - 0x3000;
-            return Unicode::String->new(substr $x,$i+2)->substr(0,$len), $i+2+$len;
-        };
-        /[S]/         && do {
-            $len = unpack 'n', substr($x,$i+1,2);
-            return Unicode::String->new(substr $x,$i+3)->substr(0,$len), $i+3+$len;
-        };
-        /[R]/         && do {
-            $len = unpack 'n', substr($x,$i+1,2);
-            my $thisChunk = Unicode::String->new(substr $x,$i+3)->substr(0,$len);
-            $len = length $thisChunk->as_string();
-            my $thatChunk = substr $x,$len+$i+3;
-            my($rest,$j) = $self->readString($x,$len+$i+3);
-            return $thisChunk->concat($rest), $j;
-        };
-        # default
-        die "Wrong binary code $_";
-    }
-}
-
-=head2 readType
-
-=cut
-
-sub readType {
-    my($self,$x,$i) = @_;
-
-    my($type,$j) = $self->readElement($x,$i);
-
-    if('Unicode::String' eq ref $type){
-        $type = $type->as_string;
-        push @{$self->{_inTypeRefs}}, $type;
-    }elsif($type =~ /\d+/){
-        $type = ${$self->{_inTypeRefs}->[$type]};
-        die "type ref idx not found $type" unless defined $type;
-    }else{
-        die "Wrong elemnent for type $type";
-    }
-    return ($type,$j);
-}
-
-=head2 readList
-
-=cut
-
-sub readList { # list, type discarded ?
-    my($self,$x,$i) = @_;
-
-    my $thisList = Hessian::List->new(); # put in ref first
-    my $ar = [];
-    push @{$self->{_inRefs}}, \$thisList;
-    
-    my($type,$len,$data);
-    for(substr $x,$i,1) {
-        /U/ && do {
-            ($type,$i) = $self->readType($x,$i+1);
-            while('Z' ne substr($x,$i,1)){
-                ($data,$i) = $self->readElement($x,$i);
-                push @$ar, $data;
-            }
-            die "U list not end with Z ", substr($x,$i,1) unless 'Z' eq substr($x,$i,1);
-            $thisList = Hessian::List->new(type=>$type,data=>$ar);
-            return $thisList,$i+1;
-        };
-                
-        /V/ && do {
-            ($type,$i) = $self->readType($x,$i+1);
-            ($len, $i) = $self->readInt($x,$i);
-            for( my $j = 0; $j < $len; $j++ ){
-                ($data, $i) = $self->readElement($x,$i);
-                push @$ar, $data;
-            }
-            $thisList = Hessian::List->new(type=>$type,len=>$len,data=>$ar);
-            return $thisList,$i;
-        };
-        /W/ && do {
-            $i++;
-            while('Z' ne substr $x,$i,1){
-                ($data,$i) = $self->readElement($x,$i);
-            }
-            die "W list not end with Z ", substr($x,$i,1) unless 'Z' eq substr($x,$i,1);
-            $thisList = Hessian::List->new(data=>$ar);
-            return $thisList,$i+1;
-        };
-        /X/ && do {
-            ($len, $i) = $self->readInt($x,$i+1);
-            for( my $j = 0; $j < $len; $j++ ){
-                ($data,$i) = $self->readElement($x,$i);
-                push @$ar, $data;
-            }
-            $thisList = Hessian::List->new(len=>$len,data=>$ar);
-            return $thisList,$i+1;
-        };
-        /[\x70-\x77]/ && do {
-            $len = unpack('C', $_) - 0x70;
-            ($type,$i) = $self->readType($x,$i+1);
-            for( my $j = 0; $j < $len; $j++ ){
-                ($data,$i) = $self->readElement($x,$i);
-                push @$ar, $data;
-            }
-            $thisList = Hessian::List->new(len=>$len,type=>$type,data=>$ar);
-            return $thisList, $i;
-        };
-        /[\x78-\x7f]/ && do {
-            $i++;
-            $len = unpack('C', $_) - 0x78;
-            for( my $j = 0; $j < $len; $j++ ){
-                ($data,$i) = $self->readElement($x,$i);
-                push @$ar, $data;
-            }
-            $thisList = Hessian::List->new(len=>$len,type=>$type,data=>$ar);
-            return $thisList, $i;
-        };
-        die "Wrong: List $_";
-    } # end for
-} #end readList
-
-=head2 readMap
-
-=cut
-
-sub readMap { # hash, type discarded ?
-    my($self,$x,$i) = @_;
-
-    my ($type,$key,$val,$ar) = ('',[]);
-    my $thisMap = Hessian::Map->new();
-    push @{$self->{_inRefs}}, \$thisMap;
-
-
-    my $ch = substr $x,$i,1;
-    $i++;
-    die "Map not begin with M/H $ch" unless $ch =~ /[MH]/;
-    ($type, $i) = $self->readType($x,$i) if $ch eq 'M';
-
-    while('Z' ne substr $x,$i,1){ # key-value pair
-        ($key,$i) = $self->readElement($x,$i);
-        $key = $key->as_string() if 'Unicode::String' eq ref $key; # for convenience
-        ($val,$i) = $self->readElement($x,$i);
-        push @$ar, $key, $val;
-    }
-    die "Map not end with Z ", substr($x,$i,1) unless 'Z' eq substr($x,$i,1);
-    $thisMap = Hessian::Map->new(type=>$type,data=>$ar);
-    return $thisMap, $i+1; # skip 'Z'
-}
-
-=head2 readRef
-
-=cut
-
-sub readRef { # obj, list or map
-    my($self,$x,$i) = @_;
-
-    my($idx,$j) = $self->readInt($x,$i+1);
-    die "failed to get int Ref idx $idx" unless defined $idx;
-    die "ref idx out of bound $idx" unless defined $self->{_inRefs}->[$idx];
-    return $self->{_inRefs}->[$idx],$j;
-}
-
-=head2 readClass
-
-=cut
-
-sub readClass {
-    my($self,$x,$i) = @_;
-
-    my $thisClass = Hessian::Class->new();
-    my($name,$len,$data);
-    my $ar = [];
-    ($name, $i) = $self->readString($x,,$i+1);
-    ($len, $i) = $self->readInt($x,$i);
-
-    for(my $j=0; $j < $len; $j++){
-        ($data, $i) = $self->readString($x,$i);
-        push @$ar,$data;
-    }
-    $thisClass = Hessian::Class->new(name=>$name,len=>$len,fields=>$ar);
-    push @{$self->{_inClassRefs}}, $thisClass;
-    return $thisClass, $i;
-}
-
-=head2 readObject
-
-=cut
-
-sub readObject {
-    my($self,$x,$i) = @_;
-
-    my $thisObject = {};
-    my $ar = [];
-    push @{$self->{_inRefs}}, \$thisObject;
-
-    my($idx,$data);
-    my $ch = substr $x,$i,1;
-    $i++;
-    if($ch eq 'O'){
-        ($idx,$i) = $self->readInt($x,$i);
-    }elsif($ch =~ /[\x60-\x6f]/){
-        $idx = unpack('C',$_) - 0x60;
-    }
-
-    my $class = $self->{_inClassRefs}->[$idx];
-    die "failed to get class for object" unless defined $class;
-
-    for(my $j=0; $j < $class->{len}; $j++){
-        ($data,$i) = $self->readElement($x,$i);
-        push @$ar, $data;
-    }
-    $thisObject = Hessian::Object->new(class=>$class,data=>$ar);
-    return $thisObject, $i;
-}
-
-=head1 AUTHOR
-
-du ling, C<< <ling.du at gmail.com> >>
-
-=head1 BUGS
-
-Please report any bugs or feature requests to C<bug-hessian-translator-v2 at rt.cpan.org>, or through
-the web interface at L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=Hessian-Client>.  I will be notified, and then you'll
-automatically be notified of progress on your bug as I make changes.
-
-
-
-
-=head1 SUPPORT
-
-You can find documentation for this module with the perldoc command.
-
-    perldoc Hessian::Client
-
-
-You can also look for information at:
-
-=over 4
-
-=item * RT: CPAN's request tracker
-
-L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Hessian-Client>
-
-=item * AnnoCPAN: Annotated CPAN documentation
-
-L<http://annocpan.org/dist/Hessian-Client>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/Hessian-Client>
-
-=item * Search CPAN
-
-L<http://search.cpan.org/dist/Hessian-Client>
 
 =back
 
 
-=head1 ACKNOWLEDGEMENTS
+=head2 read_typed_list
 
+Read a Hessian 2.0 typed list.  Note that this is mainly for compatability
+with other servers that are implemented in languages like Java where I<type>
+is actually relevant.  
 
-=head1 COPYRIGHT & LICENSE
+=head2 read_untyped_list
 
-Copyright 2009 du ling, all rights reserved.
+Read a list of arbitrarily typed entities.
 
-This program is free software; you can redistribute it and/or modify it
-under the same terms as Perl itself.
+=head2 write_hessian_array
 
+Writes an array datastructure into the outgoing Hessian message. 
 
-=cut
+Note: This object only writes B<untyped variable length> arrays.
 
-1; # End of Hessian::Translator::V2
+=head2 write_hessian_hash
+
+Writes a HASH reference into the outgoing Hessian message.
+
+=head2 write_hessian_string
+
+Writes a string scalar into the outgoing Hessian message.
+
+=head2 serialize_message
+
+Serialize a datastructure into a Hessian 2.0 message.
+
+=head2 write_hessian_call
+
+Writes out a Hessian 2 specific remote procedure call
+
+=head2 write_typed_map
+
+Work around for L<write_object|Hessian::Translator::V2/write_object> for
+serializing I<typed> hash references  and objects until I find a better way to distinguish between the two.
+
+=head2 write_object
+
+Serialize an object into a Hessian 1.0 string.
+
+=head2 write_referenced_data
+
+Write a referenced datastructure into a Hessian 1.0 string.
