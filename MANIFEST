@@ -18,7 +18,6 @@ lib/Hessian/Translator/Composite.pm
 lib/Hessian/Translator/Envelope.pm
 lib/Hessian/Translator/V1.pm
 lib/Hessian/Translator/V2.pm
-lib/Hessian/Translator/V2.pm.orig
 Makefile.PL
 MANIFEST			This list of files
 README

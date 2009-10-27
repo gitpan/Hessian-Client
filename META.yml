@@ -1,6 +1,6 @@
 ---
 name: Hessian-Client
-version: v0.2.0
+version: v0.2.1
 author:
   - 'William Travis Holton <cromulent2000_eisley@yahoo.de>'
 abstract: RPC via Hessian with a remote server.
@@ -37,7 +37,7 @@ configure_requires:
 provides:
   Hessian::Client:
     file: lib/Hessian/Client.pm
-    version: v0.2.0
+    version: v0.2.1
   Hessian::Deserializer:
     file: lib/Hessian/Deserializer.pm
   Hessian::Deserializer::Binary:
